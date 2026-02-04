@@ -1,0 +1,140 @@
+import asyncio
+import ijson
+import os
+import logging
+from datetime import datetime
+from database import get_db_pool
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+DATA_PATH = os.getenv("JSON_DATA_PATH", "data/data.json")
+
+"""
+Немножко документации о загрузке данных в бд.
+При первом запуске скрипт load_data.py будет загружать данные. Так как файл большой (500к+), 
+это может занять от 30 секунд до пары минут в зависимости от скорости диска. 
+В логах контейнера bot вы можете увидеть "Starting data loading..." и затем "Data loading finished successfully". 
+Только после этого бот начнет отвечать.
+ijson позволяет читать файл любого размера, не потребляя память. 
+executemany отправляет данные пачками по 1000 штук, что значительно быстрее построчной вставки.
+"""
+
+
+def parse_iso_date(date_str):
+    """Превращает строку ISO 8601 в объект datetime, понятный для postgres"""
+    if not date_str:
+        return None
+    try:
+        return datetime.fromisoformat(date_str)
+    except ValueError:
+        return None
+
+async def load_json_to_db():
+    if not os.path.exists(DATA_PATH):
+        logger.warning(f"File {DATA_PATH} not found. Skipping data loading.")
+        return
+
+    pool = await get_db_pool()
+    
+    # Проверка на наличие данных
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM videos")
+        if count > 0:
+            logger.info(f"Database already contains {count} videos. Skipping load.")
+            await pool.close()
+            return
+
+    logger.info("Starting data loading... (This may take a while)")
+    
+    videos_batch = []
+    snapshots_batch = []
+    BATCH_SIZE = 1000
+    total_videos = 0
+
+    async with pool.acquire() as conn:
+        with open(DATA_PATH, 'rb') as f:
+            try:
+                # Ищем массив внутри ключа "videos"
+                videos_iterator = ijson.items(f, 'videos.item')
+                
+                for video in videos_iterator:
+                    total_videos += 1
+                    
+                    if total_videos % 1000 == 0:
+                        logger.info(f"Processing video #{total_videos}...")
+
+                    # ПРЕОБРАЗОВАНИЕ ДАТ В ОБЪЕКТЫ DATETIME
+                    v_data = (
+                        video['id'],
+                        video['creator_id'],
+                        parse_iso_date(video['video_created_at']), # ! Важное изменение
+                        video['views_count'],
+                        video['likes_count'],
+                        video['comments_count'],
+                        video['reports_count'],
+                        parse_iso_date(video.get('created_at')),   # ! Важное изменение
+                        parse_iso_date(video.get('updated_at'))    # ! Важное изменение
+                    )
+                    videos_batch.append(v_data)
+
+                    if 'snapshots' in video and video['snapshots']:
+                        for snap in video['snapshots']:
+                            s_data = (
+                                snap['id'],
+                                snap['video_id'],
+                                snap['views_count'],
+                                snap['likes_count'],
+                                snap['comments_count'],
+                                snap['reports_count'],
+                                snap['delta_views_count'],
+                                snap['delta_likes_count'],
+                                snap['delta_comments_count'],
+                                snap['delta_reports_count'],
+                                parse_iso_date(snap['created_at']),       # ! Важное изменение
+                                parse_iso_date(snap.get('updated_at'))    # ! Важное изменение
+                            )
+                            snapshots_batch.append(s_data)
+
+                    # Вставка пачками
+                    if len(videos_batch) >= BATCH_SIZE:
+                        await insert_batch(conn, videos_batch, snapshots_batch)
+                        videos_batch = []
+                        snapshots_batch = []
+
+                # Вставка остатков
+                if videos_batch or snapshots_batch:
+                    await insert_batch(conn, videos_batch, snapshots_batch)
+            
+            except Exception as e:
+                logger.error(f"Error parsing or inserting JSON: {e}")
+
+    logger.info(f"Data loading finished. Total videos processed: {total_videos}")
+    await pool.close()
+
+async def insert_batch(conn, videos, snapshots):
+    try:
+        # Теперь передаются объекты datetime, asyncpg съест их с удовольствием
+        if videos:
+            await conn.executemany("""
+                INSERT INTO videos (id, creator_id, video_created_at, views_count, likes_count, comments_count, reports_count, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (id) DO NOTHING
+            """, videos)
+        
+        if snapshots:
+            await conn.executemany("""
+                INSERT INTO video_snapshots (id, video_id, views_count, likes_count, comments_count, reports_count, 
+                                           delta_views_count, delta_likes_count, delta_comments_count, delta_reports_count, 
+                                           created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (id) DO NOTHING
+            """, snapshots)
+    except Exception as e:
+        # Логируем ошибку, но даем понять, на чем упали
+        logger.error(f"Batch insert failed: {e}")
+        raise e # Пробрасываем ошибку выше, чтобы остановить загрузку, если база легла
+
+if __name__ == "__main__":
+    asyncio.run(load_json_to_db())
